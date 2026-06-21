@@ -1,0 +1,225 @@
+name: Release
+
+on:
+  push:
+    tags:
+    - "[0-9]+.[0-9]+.[0-9]+"
+
+  # allows to run this manually, for testing
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  create-release:
+    name: create-release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Get the release version from the tag
+        if: env.VERSION == ''
+        run: echo "VERSION=${{ github.ref_name }}" >> $GITHUB_ENV
+
+      - name: Show the version
+        run: |
+          echo "version is: $VERSION"
+      
+      - name: Check that tag version and Cargo.toml version are the same
+        run: |
+          if ! grep -q "version = \"$VERSION\"" Cargo.toml; then
+            echo "version does not match Cargo.toml" >&2
+            exit 1
+          fi
+          
+      - name: Create GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release create $VERSION --draft --verify-tag --title $VERSION
+
+    outputs:
+      version: ${{ env.VERSION }}
+
+  build-release:
+    name: build-release
+    needs: ['create-release']
+    runs-on: ${{ matrix.os }}
+    env:
+      CROSS_VERSION: v0.2.5
+
+    strategy:
+      matrix:
+        include:
+          - name: linux-x86_64
+            os: ubuntu-latest
+            bin_name: legba
+            target: x86_64-unknown-linux-musl
+
+          - name: linux-arm64
+            os: ubuntu-latest
+            bin_name: legba
+            target: aarch64-unknown-linux-musl
+
+          - name: linux-armv7hf
+            os: ubuntu-latest
+            bin_name: legba
+            target: armv7-unknown-linux-musleabihf
+
+          - name: linux-armv7
+            os: ubuntu-latest
+            bin_name: legba
+            target: armv7-unknown-linux-musleabi
+
+          - name: apple-darwin-arm64
+            os: macos-latest
+            bin_name: legba
+            target: ''
+
+          - name: windows-x86_64
+            os: windows-latest
+            bin_name: legba.exe
+            target: ''
+
+          - name: android-x86_64
+            os: ubuntu-latest
+            bin_name: legba
+            target: x86_64-linux-android
+
+          - name: android-arm64
+            os: ubuntu-latest
+            bin_name: legba
+            target: aarch64-linux-android
+
+          - name: android-armv7
+            os: ubuntu-latest
+            bin_name: legba
+            target: armv7-linux-androideabi
+
+      fail-fast: false
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Setup cache
+      uses: Swatinem/rust-cache@v2
+
+    - name: Build release binary (native)
+      if: matrix.target == ''
+      run: |
+        cargo build --verbose --release
+
+    - name: Build release binary (cross)
+      if: matrix.os == 'ubuntu-latest' && matrix.target != ''
+      run: |
+        cargo install cross --git https://github.com/cross-rs/cross --rev "$CROSS_VERSION" --force
+        cross build --verbose --release --target "${{ matrix.target }}"
+
+    - name: Set binary and archive name (native)
+      if: matrix.target == ''
+      shell: bash
+      run: |
+        echo "BIN=target/release/${{ matrix.bin_name }}" >> $GITHUB_ENV
+        echo "ARCHIVE=legba-${{ needs.create-release.outputs.version }}-${{ matrix.name }}" >> $GITHUB_ENV
+
+    - name: Set binary and archive name (cross)
+      if: matrix.target != ''
+      shell: bash
+      run: |
+        echo "BIN=target/${{ matrix.target }}/release/${{ matrix.bin_name }}" >> $GITHUB_ENV
+        echo "ARCHIVE=legba-${{ needs.create-release.outputs.version }}-${{ matrix.name }}" >> $GITHUB_ENV
+
+    - name: Show binary info
+      shell: bash
+      run: |
+        file "$BIN"
+
+    - name: Creating directory for archive
+      shell: bash
+      run: |
+        mkdir -p "$ARCHIVE"
+        cp "$BIN" "$ARCHIVE"/
+        cp -rf README.md LICENSE docs "$ARCHIVE"/
+        ls -la "$ARCHIVE"
+
+    - name: Build archive (Windows)
+      if: matrix.os == 'windows-latest'
+      shell: bash
+      run: |
+        7z a "$ARCHIVE.zip" "$ARCHIVE"
+        certutil -hashfile "$ARCHIVE.zip" SHA256 > "$ARCHIVE.zip.sha256"
+        echo "ASSET=$ARCHIVE.zip" >> $GITHUB_ENV
+        echo "ASSET_SUM=$ARCHIVE.zip.sha256" >> $GITHUB_ENV
+
+    - name: Build archive (Unix)
+      if: matrix.os != 'windows-latest'
+      shell: bash
+      run: |
+        tar czf "$ARCHIVE.tar.gz" "$ARCHIVE"
+        shasum -a 256 "$ARCHIVE.tar.gz" > "$ARCHIVE.tar.gz.sha256"
+        echo "ASSET=$ARCHIVE.tar.gz" >> $GITHUB_ENV
+        echo "ASSET_SUM=$ARCHIVE.tar.gz.sha256" >> $GITHUB_ENV
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      shell: bash
+      run: |
+        version="${{ needs.create-release.outputs.version }}"
+        gh release upload "$version" ${{ env.ASSET }} ${{ env.ASSET_SUM }}
+
+  build-release-deb:
+    name: build-release-deb
+    needs: ['create-release']
+    runs-on: ubuntu-latest
+    env:
+      RUST_BACKTRACE: 1
+      TARGET: x86_64-unknown-linux-musl
+
+    steps:
+    - name: Checkout repository
+      uses: actions/checkout@v4
+
+    - name: Install packages (Ubuntu)
+      run: |
+        .github/workflows/ubuntu-install-packages
+
+    - name: Install Rust
+      uses: dtolnay/rust-toolchain@master
+      with:
+        toolchain: nightly
+        target: ${{ env.TARGET }}
+
+    - name: Install cargo-deb
+      run: |
+        cargo install cargo-deb
+
+    - name: Create deployment directory
+      run: |
+        dir=deployment/deb
+        mkdir -p "$dir"
+        echo "DEPLOY_DIR=$dir" >> $GITHUB_ENV
+
+    - name: Build release binary
+      shell: bash
+      run: |
+        cargo deb --profile deb --target ${{ env.TARGET }}
+        version="${{ needs.create-release.outputs.version }}"
+        echo "DEB_DIR=target/debian" >> $GITHUB_ENV
+        echo "DEB_NAME=legba_$version-1_amd64.deb" >> $GITHUB_ENV
+
+    - name: Create sha256 sum of deb file
+      run: |
+        ls -la "$DEB_DIR"
+        cd "$DEB_DIR"
+        sum="$DEB_NAME.sha256"
+        shasum -a 256 "$DEB_NAME" > "$sum"
+        echo "SUM=$sum" >> $GITHUB_ENV
+
+    - name: Upload release archive
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      run: |
+        cd "$DEB_DIR"
+        version="${{ needs.create-release.outputs.version }}"
+        gh release upload "$version" "$DEB_NAME" "$SUM"

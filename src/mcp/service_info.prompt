@@ -1,0 +1,91 @@
+Legba is a credentials bruteforcer, password sprayer and enumerator supporting several protocols with a dedicated plugin each.
+
+## Documentation
+
+The full, canonical documentation lives at https://legba.evilsocket.net/. Whenever the embedded prompts or tool outputs do not cover what you need (extra examples, edge cases, troubleshooting, full option references, recipes, REST/MCP details, or anything else), fetch the relevant page from that site before answering or improvising. A single-file dump of the whole docs is available at https://legba.evilsocket.net/llms-full.txt if you want broad context in one request.
+
+## Supported Protocols and Features
+
+AMQP (ActiveMQ, RabbitMQ, Qpid, JORAM and Solace), Cassandra/ScyllaDB, DNS subdomain enumeration, FTP, HTTP (basic authentication, NTLMv1, NTLMv2, multipart form, custom requests with CSRF support, files/folders enumeration, virtual host enumeration), IMAP, IRC, Kerberos pre-authentication and user enumeration, LDAP, MongoDB, MQTT, Microsoft SQL, MySQL, Oracle, PostgreSQL, POP3, RDP, Redis, Samba, SSH / SFTP, SMTP, Socks5, STOMP (ActiveMQ, RabbitMQ, HornetQ and OpenMQ), TCP and UDP port scanning with banner grabbing, Telnet, VNC.
+
+## Instructions
+
+Use the `list_plugins` tool for a complete list of all the plugins and their options, start a new session with the `start_session` tool, for example:
+
+{
+  `argv`: [
+    `http.enum`,
+    `--target`,
+    `http://example.com`,
+    `--payloads`,
+    `/path/to/SecLists/Discovery/Web-Content/quickhits.txt`,
+    `--http-success-codes`,
+    `200,301,302,401,403`,
+    `--concurrency`,
+    `10`
+  ]
+}
+
+Each session you start will use up the amount of workers you specify in `--concurrency` and free them once concluded. 
+Use the `get_available_workers` tool to determine how many workers are available for use and wait if none is free.
+
+## Starting a Session
+
+Start a new session with the `start_session` tool, for example:
+
+{
+  `argv`: [
+    `http.enum`,
+    `--target`,
+    `http://example.com`,
+    `--payloads`,
+    `/path/to/SecLists/Discovery/Web-Content/quickhits.txt`,
+    `--http-success-codes`,
+    `200,301,302,401,403`,
+    `--concurrency`,
+    `10`
+  ]
+}
+
+## Arguments
+
+The tool requires a plugin name, a `--target` argument specifying the ip, hostname and (optionally) the port of the target (optional whenever it matches the default port for the given protocol) and, depending on the selected plugin, a pair of `--username` and `--password` arguments, a single `--payloads` argument (like in the case of the `dns.enum` plugin which requires a single enumeration element) or a single `-C/--combinations` argument.
+
+## Selecting One or More Targets
+
+The `--target/-T` argument supports one or multiple targets expressed as one of the following, or a comma separated list of the following:
+
+* `--target 127.0.0.1`, `--target www.google.com`, ... single target.
+* `--target 127.0.0.1:22` single target with port.
+* `--target 127.0.0.1, 192.168.1.1:80` comma separated list of targets.
+* `--target @targets.txt` load a list of targets from a file.
+* `--target 192.168.1.1-10`, `--target 192.168.1.1-10:22` IP range (with or without port).
+* `--target 192.168.1.0/24`, `--target 192.168.1.0/24:22` CIDR (with or without port).
+* `--target 10.0.0.1, 172.0.0.1:2222, @other-targets.txt, 192.168.1.1-10` any comma separated combination of them.
+
+Specify multiple targets per session whenever suitable (if scanning the same ports for multiple IPs for instance).
+
+## Providing Credentials
+
+The `--username`/`--payloads` and `--password`/`--key` arguments all support the same logic depending on the value passed to them:
+
+* If the value provided is an existing file name, it'll be loaded as a wordlist.
+* If the value provided is in the form of `@/some/path/*.txt` it'll be used as a [glob expression](https://docs.rs/glob/latest/glob/) to iterate matching files.
+* If the value provided is in the form of `#<NUMBER>-<NUMBER>:<OPTIONAL CHARSET>`, it'll be used to generate all possible permutations of the given charset (or the default one if not provided) and of the given length. For instance: `#1-3` will generate all permutations from 1 to 3 characters using the default ASCII printable charset, while `#4-5:0123456789` will generate all permutations of digits of 4 and 5 characters.
+* If the value provided is in the form of `[<NUMBER>-<NUMBER>]`, it'll be used as an integer range.
+* If the value provided is in the form of `[<NUMBER>, <NUMBER>, <NUMBER>]`, it'll be used as comma separated list of integers.
+* Anything else will be considered as a constant string.
+
+## Other Options
+
+| Option | Default | Description |
+| ------ | ------- | ----------- |
+| `--timeout <TIMEOUT>` | `10000` | Connection timeout in milliseconds. |
+| `--retries <RETRIES>` | `5` | Number of attempts if a request fails. |
+| `--retry-time <TIME>` | `1000` | Delay in milliseconds to wait before a retry. |
+| `--single-match` | |  Exit after the first positive match is found. | 
+| `--concurrency <VALUE>` | `10` |  Number of concurrent workers. |
+| `--rate-limit <LIMIT>` | `0` | Limit the number of requests per second. |
+| `-W, --wait <WAIT>` | `0` | Wait time in milliseconds per login attempt. |
+| `--jitter-min <VALUE>` | `0` | Minimum number of milliseconds for random request jittering. |
+| `--jitter-max <VALUE>` | `0` | Maximum number of milliseconds for random request jittering. |>

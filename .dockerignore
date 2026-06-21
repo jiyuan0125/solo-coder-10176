@@ -1,0 +1,11 @@
+/.github
+/.vscode
+/data
+/test-servers
+/target
+/0perator
+/site
+/docs
+/overrides
+/scripts
+/mkdocs.yml
