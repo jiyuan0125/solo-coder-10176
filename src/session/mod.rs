@@ -1,9 +1,12 @@
 use std::fs;
+use std::io::Write;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use human_bytes::human_bytes;
 use memory_stats::memory_stats;
+use rand::Rng;
 use serde::{Deserialize, Serialize};
 
 use crate::Options;
@@ -156,7 +159,18 @@ impl Session {
             let file = fs::File::open(path).map_err(|e| e.to_string())?;
             let mut session: Session = serde_json::from_reader(file).map_err(|e| e.to_string())?;
 
-            session.runtime = Runtime::new(session.options.concurrency, session.options.timeout);
+            session.options = options.clone();
+            session.runtime = Runtime::new(options.concurrency, options.timeout);
+
+            if options.single_match {
+                if let Ok(results) = session.results.lock() {
+                    if !results.is_empty() {
+                        let total = session.get_total();
+                        session.done.store(total, Ordering::Relaxed);
+                        log::info!("single-match mode with existing loot, marking as complete");
+                    }
+                }
+            }
 
             Ok(Arc::new(session))
         } else {
@@ -336,7 +350,24 @@ impl Session {
         if let Some(path) = self.options.session.as_ref() {
             log::debug!("saving session to {}", path);
             let json = serde_json::to_string_pretty(self).map_err(|e| e.to_string())?;
-            return fs::write(path, json).map_err(|e| e.to_string());
+
+            let pid = std::process::id();
+            let now = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_millis();
+            let rand: u64 = rand::rng().random();
+            let tmp_path = format!("{}.{}.{}.{}.tmp", path, pid, now, rand);
+
+            let mut file = fs::File::create(&tmp_path).map_err(|e| e.to_string())?;
+            file.write_all(json.as_bytes()).map_err(|e| e.to_string())?;
+            file.sync_all().map_err(|e| e.to_string())?;
+            drop(file);
+
+            fs::rename(&tmp_path, path).map_err(|e| {
+                let _ = fs::remove_file(&tmp_path);
+                e.to_string()
+            })?;
         }
         Ok(())
     }

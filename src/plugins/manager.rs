@@ -118,12 +118,21 @@ pub(crate) async fn run(
         None
     };
 
+    fn save_progress(session: &Session, dispatched: usize) {
+        if dispatched > session.get_done() {
+            session.done.store(dispatched, std::sync::atomic::Ordering::Relaxed);
+        }
+        if let Err(e) = session.save() {
+            log::error!("could not save session: {:?}", e);
+        }
+    }
+
     // loop credentials for this session
     let mut dispatched: usize = 0;
     for creds in combinations {
-        // exit on ctrl-c if we have to, otherwise send the new credentials to the workers
         if session.is_stop() {
-            log::debug!("exiting loop");
+            log::debug!("exiting loop, saving progress at {}", dispatched);
+            save_progress(&session, dispatched);
             return Ok(());
         }
 
@@ -140,6 +149,7 @@ pub(crate) async fn run(
         if let Err(e) = session.send_credentials(creds).await {
             if session.is_stop() {
                 log::debug!("{}", e);
+                save_progress(&session, dispatched);
                 return Ok(());
             } else {
                 log::error!("{}", e);
@@ -151,10 +161,28 @@ pub(crate) async fn run(
     Ok(())
 }
 
+fn normalize_target_key(target: &str) -> String {
+    if target.starts_with('[') {
+        if let Some(end_bracket) = target.find(']') {
+            let ip = &target[1..end_bracket];
+            let rest = &target[end_bracket + 1..];
+            return format!("{}{}", ip, rest);
+        }
+    }
+    target.to_string()
+}
+
 async fn worker(plugin: &dyn Plugin, unreachables: Arc<DashSet<Arc<str>>>, session: Arc<Session>) {
     log::debug!("worker started");
 
+    let retries = session.options.retries;
     let retry_time: time::Duration = time::Duration::from_millis(session.options.retry_time);
+    let has_jitter = session.options.jitter_max > 0;
+    let jitter_min = session.options.jitter_min;
+    let jitter_max = session.options.jitter_max;
+    let has_placeholders = |target: &str| {
+        target.contains('{') && target.contains('}')
+    };
 
     while let Ok(creds) = session.recv_credentials().await {
         if session.is_stop() {
@@ -162,89 +190,90 @@ async fn worker(plugin: &dyn Plugin, unreachables: Arc<DashSet<Arc<str>>>, sessi
             break;
         }
 
-        let mut errors = 0;
-        let mut attempt = 0;
+        let target_key = normalize_target_key(&creds.target);
+        let has_target_placeholders = has_placeholders(&creds.target);
+        let is_unreachable = !has_target_placeholders && unreachables.contains(target_key.as_str());
 
-        while attempt < session.options.retries && !session.is_stop() {
-            // perform random jitter if needed
-            if session.options.jitter_max > 0 {
-                let ms = rand::rng()
-                    .random_range(session.options.jitter_min..=session.options.jitter_max);
+        if is_unreachable {
+            session.inc_done();
+            continue;
+        }
+
+        let mut attempted = false;
+        let mut all_attempts_failed = false;
+
+        for attempt_num in 1..=retries {
+            if session.is_stop() {
+                break;
+            }
+
+            if has_jitter {
+                let ms = rand::rng().random_range(jitter_min..=jitter_max);
                 if ms > 0 {
                     log::debug!("jitter of {} ms", ms);
                     tokio::time::sleep(time::Duration::from_millis(ms)).await;
                 }
             }
 
-            attempt += 1;
-
-            // skip attempt if we had enough failures from this specific target
-            if !unreachables.contains(creds.target.as_str()) {
-                let timeout = session.runtime.get_timeout();
-                match plugin.attempt(&creds, timeout).await {
-                    Err(err) => {
-                        errors += 1;
-                        if attempt < session.options.retries {
-                            log::debug!(
-                                "[{}] attempt {}/{}: {}",
-                                &creds.target,
-                                attempt,
-                                session.options.retries,
-                                err
-                            );
-                            tokio::time::sleep(retry_time).await;
-                            continue;
-                        } else {
-                            // if the target contains a placeholder that's going to be interpolated
-                            // we can't add it to the list of unreachable
-                            if !creds.target.contains("{") && !creds.target.contains("}") {
-                                // add this target to the list of unreachable in order to avoi
-                                // pointless attempts
-                                unreachables.insert(Arc::from(creds.target.as_str()));
-
-                                log::error!(
-                                    "[{}] attempt {}/{}: {}",
-                                    &creds.target,
-                                    attempt,
-                                    session.options.retries,
-                                    err
-                                );
-                            }
-                        }
-                    }
-                    Ok(loot) => {
-                        // do we have new loot?
-                        if let Some(loots) = loot {
-                            for loot in loots {
-                                // some plugins might return the elapsed time in the loot
-                                // if we have it, we can adjust the timeout to avoid waiting
-                                // for too long
-                                if let Some(mut elapsed) = loot.get_elapsed_time() {
-                                    if elapsed.as_millis() == 0 {
-                                        // make it at least 1ms
-                                        elapsed = Duration::from_millis(1);
-                                    }
-                                    // increase the elapsed time just to be safe
-                                    elapsed *= 10;
-                                    if elapsed < timeout {
-                                        session.runtime.set_timeout(elapsed.as_millis() as u64);
-                                    }
-                                }
-
-                                session.add_loot(loot).await.unwrap();
-                            }
-                        }
-                    }
-                };
+            if session.is_stop() {
+                break;
             }
 
-            break;
+            attempted = true;
+            let timeout = session.runtime.get_timeout();
+
+            match plugin.attempt(&creds, timeout).await {
+                Err(err) => {
+                    if attempt_num < retries {
+                        log::debug!(
+                            "[{}] attempt {}/{}: {}",
+                            &creds.target,
+                            attempt_num,
+                            retries,
+                            err
+                        );
+                        tokio::time::sleep(retry_time).await;
+                    } else {
+                        all_attempts_failed = true;
+                        if !has_target_placeholders {
+                            unreachables.insert(Arc::from(target_key.as_str()));
+                        }
+                        log::error!(
+                            "[{}] attempt {}/{}: {}",
+                            &creds.target,
+                            attempt_num,
+                            retries,
+                            err
+                        );
+                    }
+                }
+                Ok(loot) => {
+                    if let Some(loots) = loot {
+                        for loot in loots {
+                            if let Some(mut elapsed) = loot.get_elapsed_time() {
+                                if elapsed.as_millis() == 0 {
+                                    elapsed = Duration::from_millis(1);
+                                }
+                                elapsed *= 10;
+                                if elapsed < timeout {
+                                    session.runtime.set_timeout(elapsed.as_millis() as u64);
+                                }
+                            }
+
+                            session.add_loot(loot).await.unwrap();
+                        }
+                    }
+                    break;
+                }
+            }
         }
 
-        session.inc_done();
-        if errors == session.options.retries {
-            session.inc_errors();
-            log::debug!("retries={} errors={}", session.options.retries, errors);
+        if attempted {
+            session.inc_done();
+            if all_attempts_failed {
+                session.inc_errors();
+                log::debug!("retries={} all failed", retries);
+            }
         }
     }
 

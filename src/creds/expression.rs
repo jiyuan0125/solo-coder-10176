@@ -5,13 +5,121 @@ use lazy_regex::{Lazy, lazy_regex};
 use regex::Regex;
 use serde::Serialize;
 
+use crate::session::Error;
+
 const DEFAULT_PERMUTATIONS_MIN_LEN: usize = 3;
 const DEFAULT_PERMUTATIONS_MAX_LEN: usize = 5;
 const DEFAULT_PERMUTATIONS_CHARSET: &str = "abcdefghijklmnopqrstuvwxyz0123456789";
 
 static PERMUTATIONS_PARSER: Lazy<Regex> = lazy_regex!(r"^#(\d+)-(\d+)(:.+)?$");
-static RANGE_MIN_MAX_PARSER: Lazy<Regex> = lazy_regex!(r"^\[(\d+)-(\d+)\]$");
-static RANGE_SET_PARSER: Lazy<Regex> = lazy_regex!(r"^\[(\d+(,\s*\d+)*)?\]$");
+static RANGE_MIN_MAX_PARSER: Lazy<Regex> = lazy_regex!(r"^\[([^\]]+)-([^\]]+)\]$");
+
+const CHINESE_NUMBERS: &[(&str, usize)] = &[
+    ("零", 0),
+    ("一", 1),
+    ("二", 2),
+    ("三", 3),
+    ("四", 4),
+    ("五", 5),
+    ("六", 6),
+    ("七", 7),
+    ("八", 8),
+    ("九", 9),
+    ("十", 10),
+    ("二十", 20),
+    ("三十", 30),
+    ("四十", 40),
+    ("五十", 50),
+    ("六十", 60),
+    ("七十", 70),
+    ("八十", 80),
+    ("九十", 90),
+    ("一百", 100),
+    ("千", 1000),
+    ("万", 10000),
+];
+
+fn parse_chinese_number(s: &str) -> Option<usize> {
+    if s.is_empty() {
+        return None;
+    }
+
+    if let Ok(n) = s.parse::<usize>() {
+        return Some(n);
+    }
+
+    for &(name, value) in CHINESE_NUMBERS {
+        if s == name {
+            return Some(value);
+        }
+    }
+
+    let mut result = 0;
+    let mut temp = 0;
+    let chars: Vec<char> = s.chars().collect();
+    let mut i = 0;
+
+    while i < chars.len() {
+        let mut found = false;
+        for len in (1..=3).rev() {
+            if i + len <= chars.len() {
+                let substr: String = chars[i..i + len].iter().collect();
+                if let Some(&(_, value)) = CHINESE_NUMBERS.iter().find(|&&(name, _)| name == substr) {
+                    if value >= 10 {
+                        if temp == 0 {
+                            temp = 1;
+                        }
+                        result += temp * value;
+                        temp = 0;
+                    } else {
+                        temp = value;
+                    }
+                    i += len;
+                    found = true;
+                    break;
+                }
+            }
+        }
+        if !found {
+            return None;
+        }
+    }
+
+    result += temp;
+
+    if result > 0 {
+        Some(result)
+    } else {
+        None
+    }
+}
+
+fn normalize_separators(s: &str) -> String {
+    s.replace('，', ",")
+        .replace('、', ",")
+        .replace('　', " ")
+        .replace('【', "[")
+        .replace('】', "]")
+}
+
+fn has_nested_brackets(s: &str) -> bool {
+    let mut depth = 0;
+    for c in s.chars() {
+        match c {
+            '[' => {
+                depth += 1;
+                if depth > 1 {
+                    return true;
+                }
+            }
+            ']' => {
+                depth -= 1;
+            }
+            _ => {}
+        }
+    }
+    false
+}
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub(crate) enum Expression {
@@ -109,18 +217,36 @@ impl fmt::Display for Expression {
     }
 }
 
-pub(crate) fn parse_expression(expr: Option<&String>) -> Expression {
+pub(crate) fn parse_expression(expr: Option<&String>) -> Result<Expression, Error> {
     if let Some(expr) = expr {
-        match expr.chars().next().unwrap_or(' ') {
-            // permutations or constant
+        let first_char = expr.chars().next().unwrap_or(' ');
+        let is_at_prefixed = first_char == '@';
+
+        if is_at_prefixed && expr.contains('*') {
+            return Ok(Expression::Glob {
+                pattern: expr[1..].to_owned(),
+            });
+        }
+
+        if is_at_prefixed {
+            let without_at = &expr[1..];
+            let filepath = Path::new(without_at);
+            if filepath.exists() && filepath.is_file() {
+                return Ok(Expression::Wordlist {
+                    filename: without_at.to_owned(),
+                });
+            }
+        }
+
+        match first_char {
             '#' => {
-                // permutations expression
                 if let Some(captures) = PERMUTATIONS_PARSER.captures(expr) {
+                    let min = captures.get(1).unwrap().as_str().parse::<usize>().map_err(|e| e.to_string())?;
+                    let max = captures.get(2).unwrap().as_str().parse::<usize>().map_err(|e| e.to_string())?;
                     if captures.get(3).is_some() {
-                        // with custom charset
-                        return Expression::Permutations {
-                            min: captures.get(1).unwrap().as_str().parse().unwrap(),
-                            max: captures.get(2).unwrap().as_str().parse().unwrap(),
+                        return Ok(Expression::Permutations {
+                            min,
+                            max,
                             charset: captures
                                 .get(3)
                                 .unwrap()
@@ -128,79 +254,126 @@ pub(crate) fn parse_expression(expr: Option<&String>) -> Expression {
                                 .strip_prefix(':')
                                 .unwrap()
                                 .to_owned(),
-                        };
+                        });
                     } else {
-                        // with default charset
-                        return Expression::Permutations {
-                            min: captures.get(1).unwrap().as_str().parse().unwrap(),
-                            max: captures.get(2).unwrap().as_str().parse().unwrap(),
+                        return Ok(Expression::Permutations {
+                            min,
+                            max,
                             charset: DEFAULT_PERMUTATIONS_CHARSET.to_owned(),
-                        };
+                        });
                     }
                 }
             }
-            // glob expression or constant
-            '@' if expr.contains('*') => {
-                // in order to be considered a glob expression at least one * must be used
-                return Expression::Glob {
-                    pattern: expr[1..].to_owned(),
-                };
-            }
-            // range expression or constant
             '[' => {
-                if let Some(captures) = RANGE_MIN_MAX_PARSER.captures(expr) {
-                    // [min-max]
-                    return Expression::Range {
-                        min: captures.get(1).unwrap().as_str().parse().unwrap(),
-                        max: captures.get(2).unwrap().as_str().parse().unwrap(),
-                        set: vec![],
-                    };
-                } else if let Some(captures) = RANGE_SET_PARSER.captures(expr) {
-                    // [n, n, n, ...]
-                    return Expression::Range {
-                        min: 0,
-                        max: 0,
-                        set: captures
-                            .get(1)
-                            .unwrap()
-                            .as_str()
-                            .split(',')
-                            .map(|s| s.trim().parse().unwrap())
-                            .collect(),
-                    };
+                if expr.ends_with(']') {
+                    let inner = &expr[1..expr.len() - 1];
+                    if !inner.contains(']') {
+                        return parse_bracket_expression(expr);
+                    }
                 }
             }
             _ => {}
-        };
+        }
 
-        // file name, constant or multiple
-        let filepath = Path::new(&expr);
-        if filepath.exists() && filepath.is_file() {
-            // this is a file name
-            return Expression::Wordlist {
-                filename: expr.to_owned(),
-            };
-        } else if expr.contains(',') {
-            // parse as multiple expressions
+        if expr.contains(',') {
             let multi = expr
                 .split(',')
                 .map(|s| s.trim().to_owned())
                 .collect::<Vec<String>>();
             let mut expressions = vec![];
             for exp in multi {
-                expressions.push(parse_expression(Some(exp).as_ref()));
+                expressions.push(parse_expression(Some(&exp))?);
             }
 
-            return Expression::Multiple { expressions };
-        } else {
-            // constant value casually starting with @
-            return Expression::Constant {
-                value: expr.to_owned(),
-            };
+            return Ok(Expression::Multiple { expressions });
+        }
+
+        if !is_at_prefixed {
+            let filepath = Path::new(&expr);
+            if filepath.exists() && filepath.is_file() {
+                return Ok(Expression::Wordlist {
+                    filename: expr.to_owned(),
+                });
+            }
+        }
+
+        return Ok(Expression::Constant {
+            value: expr.to_owned(),
+        });
+    }
+
+    Ok(Expression::default())
+}
+
+fn parse_bracket_expression(expr: &str) -> Result<Expression, Error> {
+    if has_nested_brackets(expr) {
+        return Err(format!("nested brackets are not allowed: {}", expr));
+    }
+
+    let normalized = normalize_separators(expr);
+
+    if let Some(captures) = RANGE_MIN_MAX_PARSER.captures(&normalized) {
+        let min_str = captures.get(1).unwrap().as_str().trim();
+        let max_str = captures.get(2).unwrap().as_str().trim();
+
+        let min = parse_chinese_number(min_str)
+            .ok_or_else(|| format!("invalid range min value: {}", min_str))?;
+        let max = parse_chinese_number(max_str)
+            .ok_or_else(|| format!("invalid range max value: {}", max_str))?;
+
+        return Ok(Expression::Range {
+            min,
+            max,
+            set: vec![],
+        });
+    }
+
+    if normalized.starts_with('[') && normalized.ends_with(']') {
+        let inner = &normalized[1..normalized.len() - 1];
+        if inner.trim().is_empty() {
+            return Ok(Expression::Range {
+                min: 0,
+                max: 0,
+                set: vec![],
+            });
+        }
+
+        let has_comma = inner.contains(',');
+        let parts: Vec<&str> = inner.split(',').map(|s| s.trim()).collect();
+
+        let mut numbers = Vec::new();
+        let mut all_valid = true;
+        for part in &parts {
+            if part.is_empty() {
+                continue;
+            }
+            if let Some(n) = parse_chinese_number(part) {
+                numbers.push(n);
+            } else {
+                all_valid = false;
+                break;
+            }
+        }
+
+        if all_valid && !numbers.is_empty() {
+            return Ok(Expression::Range {
+                min: 0,
+                max: 0,
+                set: numbers,
+            });
+        }
+
+        if has_comma {
+            return Err(format!(
+                "invalid value in range set expression: {}",
+                expr
+            ));
         }
     }
 
-    Expression::default()
+    Ok(Expression::Constant {
+        value: expr.to_owned(),
+    })
 }
 
 #[cfg(test)]
@@ -213,7 +386,7 @@ mod tests {
 
     #[test]
     fn can_parse_none() {
-        let res = parse_expression(None);
+        let res = parse_expression(None).unwrap();
         assert_eq!(
             res,
             Expression::Permutations {
@@ -226,7 +399,7 @@ mod tests {
 
     #[test]
     fn can_parse_constant() {
-        let res = parse_expression(Some("admin".to_owned()).as_ref());
+        let res = parse_expression(Some("admin".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Constant {
@@ -243,7 +416,7 @@ mod tests {
         #[cfg(windows)]
         let filename = "C:\\Windows\\System32\\drivers\\etc\\hosts";
 
-        let res = parse_expression(Some(filename.to_owned()).as_ref());
+        let res = parse_expression(Some(filename.to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Wordlist {
@@ -254,7 +427,7 @@ mod tests {
 
     #[test]
     fn can_parse_constant_with_at() {
-        let res = parse_expression(Some("@m_n0t_@_f1l3".to_owned()).as_ref());
+        let res = parse_expression(Some("@m_n0t_@_f1l3".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Constant {
@@ -265,7 +438,7 @@ mod tests {
 
     #[test]
     fn can_parse_constant_with_bracket() {
-        let res = parse_expression(Some("[m_n0t_@_range]".to_owned()).as_ref());
+        let res = parse_expression(Some("[m_n0t_@_range]".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Constant {
@@ -276,7 +449,7 @@ mod tests {
 
     #[test]
     fn can_parse_permutations_with_default_charset() {
-        let res = parse_expression(Some("#1-3".to_owned()).as_ref());
+        let res = parse_expression(Some("#1-3".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Permutations {
@@ -289,7 +462,7 @@ mod tests {
 
     #[test]
     fn can_parse_permutations_with_custom_charset() {
-        let res = parse_expression(Some("#1-10:abcdef".to_owned()).as_ref());
+        let res = parse_expression(Some("#1-10:abcdef".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Permutations {
@@ -302,7 +475,7 @@ mod tests {
 
     #[test]
     fn can_parse_range_with_min_max() {
-        let res = parse_expression(Some("[1-3]".to_owned()).as_ref());
+        let res = parse_expression(Some("[1-3]".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Range {
@@ -315,7 +488,7 @@ mod tests {
 
     #[test]
     fn can_parse_range_with_set() {
-        let res = parse_expression(Some("[1,3,4, 5, 6, 7, 8, 12,666]".to_owned()).as_ref());
+        let res = parse_expression(Some("[1,3,4, 5, 6, 7, 8, 12,666]".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Range {
@@ -328,7 +501,7 @@ mod tests {
 
     #[test]
     fn can_parse_glob() {
-        let res = parse_expression(Some("@/etc/*".to_owned()).as_ref());
+        let res = parse_expression(Some("@/etc/*".to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Glob {
@@ -340,7 +513,7 @@ mod tests {
     #[test]
     fn can_parse_multiple() {
         let expr = "1,[3-5],[6-8],9,[10-13]";
-        let res = parse_expression(Some(expr.to_owned()).as_ref());
+        let res = parse_expression(Some(expr.to_owned()).as_ref()).unwrap();
         assert_eq!(
             res,
             Expression::Multiple {
@@ -377,7 +550,7 @@ mod tests {
         let res = parse_expression(Some(expr.to_owned()).as_ref());
         assert_eq!(
             res,
-            Expression::Multiple {
+            Ok(Expression::Multiple {
                 expressions: vec![
                     Expression::Range {
                         min: 1,
@@ -407,7 +580,7 @@ mod tests {
                         set: vec![],
                     },
                 ]
-            }
+            })
         )
     }
 
@@ -417,7 +590,7 @@ mod tests {
         let res = parse_expression(Some(expr.to_owned()).as_ref());
         assert_eq!(
             res,
-            Expression::Multiple {
+            Ok(Expression::Multiple {
                 expressions: vec![
                     Expression::Constant {
                         value: "1".to_string()
@@ -431,7 +604,7 @@ mod tests {
                         value: "9".to_string()
                     },
                 ]
-            }
+            })
         )
     }
 }

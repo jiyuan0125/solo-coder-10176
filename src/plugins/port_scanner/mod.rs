@@ -184,9 +184,7 @@ impl Plugin for PortScanner {
 
     fn override_payload(&self) -> Option<Expression> {
         if self.ports.is_default() {
-            Some(creds::parse_expression(Some(
-                &options::DEFAULT_PORTS.to_owned(),
-            )))
+            Some(creds::parse_expression(Some(&options::DEFAULT_PORTS.to_owned())).unwrap())
         } else {
             Some(self.ports.clone())
         }
@@ -194,9 +192,9 @@ impl Plugin for PortScanner {
 
     async fn setup(&mut self, opts: &Options) -> Result<(), Error> {
         self.ports = if opts.username.is_some() {
-            creds::parse_expression(opts.username.as_ref())
+            creds::parse_expression(opts.username.as_ref())?
         } else {
-            creds::parse_expression(Some(&opts.port_scanner.port_scanner_ports))
+            creds::parse_expression(Some(&opts.port_scanner.port_scanner_ports))?
         };
 
         if !matches!(

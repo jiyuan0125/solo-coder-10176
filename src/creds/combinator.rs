@@ -18,6 +18,40 @@ fn process_password_template(password: &str, username: &str) -> String {
     password.replace("{user}", username)
 }
 
+fn split_escaped(line: &str, separator: &str) -> Option<(String, String)> {
+    let sep_len = separator.len();
+    let mut i = 0;
+    let bytes = line.as_bytes();
+
+    while i < bytes.len() {
+        if bytes[i] == b'\\' && i + 1 < bytes.len() {
+            i += 2;
+        } else if line[i..].starts_with(separator) {
+            let before = &line[..i];
+            let after = &line[i + sep_len..];
+
+            let mut unescaped = String::with_capacity(before.len());
+            let mut j = 0;
+            let before_bytes = before.as_bytes();
+            while j < before_bytes.len() {
+                if before_bytes[j] == b'\\' && j + 1 < before_bytes.len() {
+                    unescaped.push(before_bytes[j + 1] as char);
+                    j += 2;
+                } else {
+                    unescaped.push(before_bytes[j] as char);
+                    j += 1;
+                }
+            }
+
+            return Some((unescaped, after.to_owned()));
+        } else {
+            i += 1;
+        }
+    }
+
+    None
+}
+
 #[derive(ValueEnum, Serialize, Deserialize, Debug, Default, Clone)]
 pub(crate) enum IterationStrategy {
     #[default]
@@ -94,11 +128,11 @@ impl Combinator {
 
         // get either user provided payload/username, or plugin override or password
         let payload_expr = if options.username.is_some() {
-            expression::parse_expression(options.username.as_ref())
+            expression::parse_expression(options.username.as_ref())?
         } else if let Some(override_expr) = override_expr {
             override_expr
         } else {
-            expression::parse_expression(options.password.as_ref())
+            expression::parse_expression(options.password.as_ref())?
         };
         let payload_it = iterator::new(payload_expr.clone())?;
         let search_space_size: usize = targets.len() * payload_it.search_space_size();
@@ -142,12 +176,21 @@ impl Combinator {
         } else {
             // perform the cartesian product of all usernames and passwords from distinct sources
             let mode = Mode::Multi;
-            let user_expr = expression::parse_expression(options.username.as_ref());
+            let user_expr = expression::parse_expression(options.username.as_ref())?;
             let user_it = iterator::new(user_expr.clone())?;
-            let pass_expr = expression::parse_expression(options.password.as_ref());
+            let pass_expr = expression::parse_expression(options.password.as_ref())?;
             let pass_it = iterator::new(pass_expr.clone())?;
             let search_space_size =
                 targets.len() * user_it.search_space_size() * pass_it.search_space_size();
+
+            const MAX_SEARCH_SPACE: usize = 10_000_000;
+            if search_space_size > MAX_SEARCH_SPACE {
+                return Err(format!(
+                    "search space too large: {} combinations (max allowed: {})",
+                    search_space_size, MAX_SEARCH_SPACE
+                ));
+            }
+
             let product =
                 Self::combine_iterators(&options, targets.to_owned(), user_it, Some(pass_it));
 
@@ -199,39 +242,42 @@ impl Iterator for Combinator {
     type Item = Credentials;
 
     fn next(&mut self) -> Option<Self::Item> {
-        // we're done
-        if let Some((target, outer, inner)) = self.product.next() {
-            let (username, password) = match self.mode {
-                Mode::Multi | Mode::Single => match self.options.iterate_by {
-                    IterationStrategy::User => (outer, inner),
-                    IterationStrategy::Password => (inner, outer),
-                },
-                Mode::Combo => {
-                    if let Some((user, pass)) = outer.split_once(&self.options.separator) {
-                        (user.to_owned(), pass.to_owned())
-                    } else {
-                        panic!(
-                            "line '{}' of {} can't be splitted with '{}'",
-                            outer,
-                            self.options.combinations.as_ref().unwrap(),
-                            &self.options.separator,
-                        );
+        loop {
+            if let Some((target, outer, inner)) = self.product.next() {
+                let (username, password) = match self.mode {
+                    Mode::Multi | Mode::Single => match self.options.iterate_by {
+                        IterationStrategy::User => (outer, inner),
+                        IterationStrategy::Password => (inner, outer),
+                    },
+                    Mode::Combo => {
+                        if let Some((user, pass)) = split_escaped(&outer, &self.options.separator)
+                        {
+                            (user, pass)
+                        } else {
+                            log::warn!(
+                                "line '{}' of {} can't be split with '{}', skipping",
+                                outer,
+                                self.options.combinations.as_ref().unwrap(),
+                                &self.options.separator,
+                            );
+                            continue;
+                        }
                     }
-                }
-            };
+                };
 
-            self.dispatched += 1;
+                self.dispatched += 1;
 
-            // Process password template placeholders (e.g., {user} -> actual username)
-            let processed_password = process_password_template(&password, &username);
+                // Process password template placeholders (e.g., {user} -> actual username)
+                let processed_password = process_password_template(&password, &username);
 
-            Some(Credentials {
-                target,
-                username,
-                password: processed_password,
-            })
-        } else {
-            None
+                return Some(Credentials {
+                    target,
+                    username,
+                    password: processed_password,
+                });
+            } else {
+                return None;
+            }
         }
     }
 }

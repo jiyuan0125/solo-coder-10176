@@ -504,7 +504,7 @@ mod tests {
         let test_payload = "test_payload".to_string();
         let plugin = MockPlugin::new("test_single_payload_strategy")
             .with_single_payload()
-            .with_override_payload(parse_expression(Some(&test_payload)));
+            .with_override_payload(parse_expression(Some(&test_payload)).unwrap());
         let plugin_box: Box<dyn Plugin> = Box::new(plugin);
         let plugin_mut: &'static mut dyn Plugin = Box::leak(plugin_box);
 
@@ -513,7 +513,7 @@ mod tests {
             "test_single_payload_strategy",
             MockPlugin::new("test_single_payload_strategy")
                 .with_single_payload()
-                .with_override_payload(parse_expression(Some(&test_payload))),
+                .with_override_payload(parse_expression(Some(&test_payload)).unwrap()),
         );
         *INVENTORY.lock().unwrap() = inventory;
 

@@ -138,7 +138,7 @@ impl Plugin for SMBShares {
     }
 
     fn override_payload(&self) -> Option<Expression> {
-        Some(creds::parse_expression(Some(&DEFAULT_SHARES.to_owned())))
+        Some(creds::parse_expression(Some(&DEFAULT_SHARES.to_owned())).unwrap())
     }
 
     async fn attempt(
