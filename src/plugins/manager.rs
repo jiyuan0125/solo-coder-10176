@@ -95,7 +95,11 @@ pub(crate) async fn run(
 ) -> Result<(), Error> {
     let single = matches!(plugin.payload_strategy(), PayloadStrategy::Single);
     let override_payload = plugin.override_payload();
-    let combinations = session.combinations(override_payload, single)?;
+    let (combinations, restored_fully) = session.combinations(override_payload, single)?;
+    if !restored_fully {
+        log::debug!("restore was interrupted, exiting early");
+        return Ok(());
+    }
     let unreachables: Arc<DashSet<Arc<str>>> = Arc::new(DashSet::default());
 
     // spawn worker tasks

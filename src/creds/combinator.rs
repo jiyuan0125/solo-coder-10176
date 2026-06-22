@@ -78,15 +78,27 @@ pub(crate) struct Combinator {
 }
 
 impl Combinator {
-    fn reset_from(&mut self, from: usize) {
+    fn reset_from<F>(&mut self, from: usize, should_stop: F) -> bool
+    where
+        F: Fn() -> bool,
+    {
         if from > 0 {
             let start = time::Instant::now();
             while self.dispatched < from {
+                if should_stop() {
+                    log::info!(
+                        "restore interrupted at credential {}/{}",
+                        self.dispatched,
+                        from
+                    );
+                    return false;
+                }
                 let _ = self.product.next();
                 self.dispatched += 1;
             }
             log::info!("restored from credential {} in {:?}", from, start.elapsed());
         }
+        true
     }
 
     fn combine_iterators(
@@ -206,13 +218,17 @@ impl Combinator {
         }
     }
 
-    pub fn create(
+    pub fn create<F>(
         targets: &Vec<String>,
         options: Options,
         from: usize,
         single: bool,
         override_expression: Option<Expression>,
-    ) -> Result<Self, Error> {
+        should_stop: F,
+    ) -> Result<(Self, bool), Error>
+    where
+        F: Fn() -> bool,
+    {
         let mut combinator = if single {
             Self::for_single_payload(targets, options, override_expression)?
         } else {
@@ -220,9 +236,9 @@ impl Combinator {
         };
 
         // restore from last state if needed
-        combinator.reset_from(from);
+        let restored_fully = combinator.reset_from(from, should_stop);
 
-        Ok(combinator)
+        Ok((combinator, restored_fully))
     }
 
     pub fn search_space_size(&self) -> usize {
@@ -301,7 +317,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&targets, opts, 2, false, None).unwrap();
+        let (comb, _) = Combinator::create(&targets, opts, 2, false, None, || false).unwrap();
         let expected = vec![
             Credentials {
                 target: "foo".to_owned(),
@@ -332,7 +348,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&targets, opts, 0, false, None).unwrap();
+        let (comb, _) = Combinator::create(&targets, opts, 0, false, None, || false).unwrap();
         let expected = vec![
             Credentials {
                 target: "foo".to_owned(),
@@ -373,7 +389,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&targets, opts, 0, false, None).unwrap();
+        let (comb, _) = Combinator::create(&targets, opts, 0, false, None, || false).unwrap();
         let expected = vec![
             Credentials {
                 target: "foo".to_owned(),
@@ -422,8 +438,8 @@ mod tests {
             ..Default::default()
         };
 
-        let by_user_comb = Combinator::create(&targets, by_user_opts, 0, false, None).unwrap();
-        let by_pass_comb = Combinator::create(&targets, by_pass_opts, 0, false, None).unwrap();
+        let (by_user_comb, _) = Combinator::create(&targets, by_user_opts, 0, false, None, || false).unwrap();
+        let (by_pass_comb, _) = Combinator::create(&targets, by_pass_opts, 0, false, None, || false).unwrap();
 
         assert_eq!(
             by_user_comb.search_space_size(),
@@ -449,7 +465,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&targets, opts, 0, false, None).unwrap();
+        let (comb, _) = Combinator::create(&targets, opts, 0, false, None, || false).unwrap();
         let mut expected = vec![];
         let mut got = vec![];
 
@@ -481,7 +497,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&targets, opts, 0, true, None).unwrap();
+        let (comb, _) = Combinator::create(&targets, opts, 0, true, None, || false).unwrap();
         let mut expected = vec![];
         let mut got = vec![];
 
@@ -510,7 +526,7 @@ mod tests {
             set: vec![],
         };
         let opts = crate::Options::default();
-        let comb = Combinator::create(&vec!["foo".to_owned()], opts, 0, true, Some(expr)).unwrap();
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, true, Some(expr), || false).unwrap();
         let mut expected = vec![];
         let mut got = vec![];
 
@@ -538,7 +554,7 @@ mod tests {
             set: set.clone(),
         };
         let opts = crate::Options::default();
-        let comb = Combinator::create(&vec!["foo".to_owned()], opts, 0, true, Some(expr)).unwrap();
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, true, Some(expr), || false).unwrap();
         let mut expected = vec![];
         let mut got = vec![];
 
@@ -593,7 +609,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&vec!["foo".to_owned()], opts, 0, false, None).unwrap();
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, false, None, || false).unwrap();
         let tot = comb.search_space_size();
         let mut got = vec![];
 
@@ -635,7 +651,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&vec!["foo".to_owned()], opts, 0, true, None).unwrap();
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, true, None, || false).unwrap();
         let tot = comb.search_space_size();
         assert_eq!(expected.len(), tot);
 
@@ -677,7 +693,7 @@ mod tests {
             ..Default::default()
         };
 
-        let comb = Combinator::create(&vec!["foo".to_owned()], opts, 0, false, None).unwrap();
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, false, None, || false).unwrap();
         let tot = comb.search_space_size();
         assert_eq!(expected.len(), tot);
 
@@ -688,5 +704,104 @@ mod tests {
 
         assert_eq!(got.len(), tot);
         assert_eq!(expected, got);
+    }
+
+    #[test]
+    fn combo_mode_handles_escaped_separator() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmppath = tmpdir.path().join("combinations.txt");
+        let mut tmpdata = File::create(&tmppath).unwrap();
+
+        writeln!(tmpdata, "user\\:name:password").unwrap();
+        writeln!(tmpdata, "normal:pass").unwrap();
+        tmpdata.flush().unwrap();
+        drop(tmpdata);
+
+        let opts = crate::Options {
+            combinations: Some(tmppath.to_str().unwrap().to_owned()),
+            separator: String::from(":"),
+            ..Default::default()
+        };
+
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, false, None, || false).unwrap();
+        let got: Vec<Credentials> = comb.collect();
+
+        assert_eq!(got.len(), 2);
+        assert_eq!(got[0].username, "user:name");
+        assert_eq!(got[0].password, "password");
+        assert_eq!(got[1].username, "normal");
+        assert_eq!(got[1].password, "pass");
+    }
+
+    #[test]
+    fn combo_mode_skips_invalid_lines_without_panic() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmppath = tmpdir.path().join("combinations.txt");
+        let mut tmpdata = File::create(&tmppath).unwrap();
+
+        writeln!(tmpdata, "valid:pass").unwrap();
+        writeln!(tmpdata, "no-separator-here").unwrap();
+        writeln!(tmpdata, "another:valid").unwrap();
+        tmpdata.flush().unwrap();
+        drop(tmpdata);
+
+        let opts = crate::Options {
+            combinations: Some(tmppath.to_str().unwrap().to_owned()),
+            separator: String::from(":"),
+            ..Default::default()
+        };
+
+        let (comb, _) = Combinator::create(&vec!["foo".to_owned()], opts, 0, false, None, || false).unwrap();
+        let got: Vec<Credentials> = comb.collect();
+
+        assert_eq!(got.len(), 2);
+    }
+
+    #[test]
+    fn search_space_too_large_returns_error() {
+        let targets: Vec<String> = (0..100).map(|i| format!("target{}", i)).collect();
+
+        let opts = crate::Options {
+            username: Some("#1-5:abcdefghijklmnopqrstuvwxyz".to_owned()),
+            password: Some("#1-5:abcdefghijklmnopqrstuvwxyz".to_owned()),
+            ..Default::default()
+        };
+
+        let result = Combinator::create(&targets, opts, 0, false, None, || false);
+        assert!(result.is_err());
+        let err = match result {
+            Err(e) => e,
+            _ => unreachable!(),
+        };
+        assert!(err.contains("search space too large"));
+    }
+
+    #[test]
+    fn reset_from_can_be_interrupted() {
+        let targets = vec!["foo".to_owned()];
+        let opts = crate::Options {
+            iterate_by: IterationStrategy::User,
+            username: Some("#1-3:u".to_owned()),
+            password: Some("#1-3:p".to_owned()),
+            ..Default::default()
+        };
+
+        let stop_counter = std::sync::atomic::AtomicUsize::new(0);
+        let (comb, restored) = Combinator::create(
+            &targets,
+            opts,
+            9,
+            false,
+            None,
+            || {
+                let prev = stop_counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                prev >= 3
+            },
+        )
+        .unwrap();
+
+        assert!(!restored);
+        let remaining: Vec<Credentials> = comb.collect();
+        assert_eq!(remaining.len(), 9 - 3);
     }
 }

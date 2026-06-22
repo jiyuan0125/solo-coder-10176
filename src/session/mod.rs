@@ -290,16 +290,24 @@ impl Session {
         &self,
         override_payload: Option<Expression>,
         single: bool,
-    ) -> Result<Combinator, Error> {
-        let combinator = Combinator::create(
+    ) -> Result<(Combinator, bool), Error> {
+        let sess = self.clone();
+        let (combinator, restored_fully) = Combinator::create(
             &self.targets,
             self.options.clone(),
             self.get_done(),
             single,
             override_payload,
+            move || sess.is_stop(),
         )?;
 
         self.set_total(combinator.search_space_size());
+
+        if !restored_fully {
+            if let Err(e) = self.save() {
+                log::error!("could not save session after interrupted restore: {:?}", e);
+            }
+        }
 
         if single {
             log::info!("using -> {}\n", combinator.username_expression());
@@ -308,7 +316,7 @@ impl Session {
             log::info!("password -> {}\n", combinator.password_expression());
         }
 
-        Ok(combinator)
+        Ok((combinator, restored_fully))
     }
 
     pub async fn add_loot(&self, loot: Loot) -> Result<(), Error> {
@@ -407,5 +415,148 @@ impl Session {
 
             tokio::time::sleep(report_interval).await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::Options;
+    use std::fs;
+    use std::sync::atomic::Ordering;
+
+    fn make_options(target: &str, retries: usize, single_match: bool) -> Options {
+        Options {
+            target: Some(target.to_owned()),
+            username: Some("u".to_owned()),
+            password: Some("p".to_owned()),
+            retries,
+            single_match,
+            concurrency: 1,
+            timeout: 1000,
+            quiet: true,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn new_options_override_disk_session_options() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let session_path = tmpdir.path().join("session.json");
+
+        let opts_old = make_options("127.0.0.1:80", 1, false);
+        let opts_old_with_session = Options {
+            session: Some(session_path.to_str().unwrap().to_owned()),
+            ..opts_old
+        };
+        {
+            let sess = Session::new_for_tests(opts_old_with_session).unwrap();
+            sess.save().unwrap();
+        }
+
+        let opts_new = make_options("127.0.0.1:80", 99, false);
+        let opts_new_with_session = Options {
+            session: Some(session_path.to_str().unwrap().to_owned()),
+            ..opts_new
+        };
+        let restored = Session::new_for_tests(opts_new_with_session).unwrap();
+
+        assert_eq!(restored.options.retries, 99);
+    }
+
+    #[test]
+    fn single_match_with_existing_loot_marks_complete() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let session_path = tmpdir.path().join("session.json");
+
+        let opts = make_options("127.0.0.1:80", 3, true);
+        let opts_with_session = Options {
+            session: Some(session_path.to_str().unwrap().to_owned()),
+            ..opts
+        };
+        {
+            let sess = Session::new_for_tests(opts_with_session).unwrap();
+            sess.set_total(100);
+            sess.done.store(5, Ordering::Relaxed);
+            sess.results.lock().unwrap().push(Loot::new(
+                "test",
+                "127.0.0.1:80",
+                vec![
+                    ("username".to_string(), "u".to_string()),
+                    ("password".to_string(), "p".to_string()),
+                ],
+            ));
+            sess.save().unwrap();
+        }
+
+        let opts2 = make_options("127.0.0.1:80", 3, true);
+        let opts2_with_session = Options {
+            session: Some(session_path.to_str().unwrap().to_owned()),
+            ..opts2
+        };
+        let restored = Session::new_for_tests(opts2_with_session).unwrap();
+
+        assert_eq!(restored.get_done(), restored.get_total());
+        assert!(restored.is_done());
+    }
+
+    #[test]
+    fn concurrent_saves_do_not_corrupt() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let session_path = tmpdir.path().join("session.json");
+
+        let opts = make_options("127.0.0.1:80", 3, false);
+        let opts_with_session = Options {
+            session: Some(session_path.to_str().unwrap().to_owned()),
+            ..opts
+        };
+        let sess = Session::new_for_tests(opts_with_session).unwrap();
+        sess.set_total(10);
+
+        let mut handles = vec![];
+        for i in 0..10 {
+            let s = sess.clone();
+            handles.push(std::thread::spawn(move || {
+                s.done.store(i, Ordering::Relaxed);
+                s.save().unwrap();
+            }));
+        }
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        drop(sess);
+
+        let content = fs::read_to_string(&session_path).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert!(parsed.is_object());
+        assert!(parsed.get("done").is_some());
+    }
+
+    #[test]
+    fn save_uses_unique_temp_files() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let session_path = tmpdir.path().join("session.json");
+
+        let opts = make_options("127.0.0.1:80", 3, false);
+        let opts_with_session = Options {
+            session: Some(session_path.to_str().unwrap().to_owned()),
+            ..opts
+        };
+        let sess = Session::new_for_tests(opts_with_session).unwrap();
+
+        sess.save().unwrap();
+        sess.save().unwrap();
+
+        let mut tmps = vec![];
+        for entry in fs::read_dir(tmpdir.path()).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().into_string().unwrap();
+            if name.ends_with(".tmp") {
+                tmps.push(name);
+            }
+        }
+        assert!(tmps.is_empty(), "leftover tmp files: {:?}", tmps);
+        assert!(session_path.exists());
     }
 }

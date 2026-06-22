@@ -1,6 +1,7 @@
 use std::{
     fs::File,
     io::{BufRead, BufReader},
+    net::IpAddr,
     str::FromStr,
 };
 
@@ -217,19 +218,97 @@ fn parse_multiple_targets_atom(expression: &str) -> Result<Vec<String>, Error> {
             }
         }
 
-        Ok(vec![expression.to_string()])
+        if expression.is_empty() {
+            return Err("invalid target: empty string".to_owned());
+        }
+
+        if let Ok(ip) = expression.parse::<IpAddr>() {
+            return Ok(vec![ip.to_string()]);
+        }
+
+        if let Some((host_part, port_part)) = expression.rsplit_once(':') {
+            if port_part.chars().all(|c| c.is_ascii_digit()) {
+                if let Ok(_) = host_part.parse::<IpAddr>() {
+                    return Ok(vec![expression.to_owned()]);
+                }
+                let host = host_part.strip_prefix('[').and_then(|h| h.strip_suffix(']')).unwrap_or(host_part);
+                if let Ok(_) = host.parse::<IpAddr>() {
+                    return Ok(vec![expression.to_owned()]);
+                }
+                if !host.is_empty() && !host.contains(':') && !host.contains('-') {
+                    return Ok(vec![expression.to_owned()]);
+                }
+            }
+        }
+
+        if expression.contains("://") {
+            return Ok(vec![expression.to_owned()]);
+        }
+
+        if !expression.contains(':')
+            && !expression.contains('-')
+            && !expression.chars().all(|c| c.is_ascii_digit() || c == '.')
+        {
+            return Ok(vec![expression.to_owned()]);
+        }
+
+        if let Some(colon_idx) = expression.find(':') {
+            let before = &expression[..colon_idx];
+            let after = &expression[colon_idx + 1..];
+            if before.chars().all(|c| c.is_ascii_digit() || c == '.')
+                && !after.is_empty()
+                && !after.contains(':')
+                && !before.contains('-')
+            {
+                if let Ok(_) = before.parse::<std::net::Ipv4Addr>() {
+                    return Ok(vec![expression.to_owned()]);
+                }
+            }
+        }
+
+        if !expression.contains(':')
+            && !expression.contains('-')
+        {
+            if let Ok(_) = expression.parse::<std::net::Ipv4Addr>() {
+                return Ok(vec![expression.to_owned()]);
+            }
+        }
+
+        Err(format!("invalid target expression: {}", expression))
     }
 }
 
 pub(crate) fn parse_multiple_targets(expression: &str) -> Result<Vec<String>, Error> {
     let mut all = vec![];
+    let mut bracket_depth = 0i32;
+    let mut current = String::new();
 
-    for atom in expression
-        .split(',')
-        .map(|s| s.trim())
-        .filter(|s| !s.is_empty())
-    {
-        all.extend(parse_multiple_targets_atom(atom)?);
+    for ch in expression.chars() {
+        match ch {
+            '[' => {
+                bracket_depth += 1;
+                current.push(ch);
+            }
+            ']' => {
+                bracket_depth -= 1;
+                current.push(ch);
+            }
+            ',' if bracket_depth == 0 => {
+                let trimmed = current.trim().to_owned();
+                if !trimmed.is_empty() {
+                    all.extend(parse_multiple_targets_atom(&trimmed)?);
+                }
+                current.clear();
+            }
+            _ => {
+                current.push(ch);
+            }
+        }
+    }
+
+    let trimmed = current.trim().to_owned();
+    if !trimmed.is_empty() {
+        all.extend(parse_multiple_targets_atom(&trimmed)?);
     }
 
     Ok(all)
@@ -399,5 +478,68 @@ mod tests {
         ))
         .unwrap();
         assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn can_parse_ipv6_range() {
+        let expected = Ok(vec![
+            "2001:db8::1".to_owned(),
+            "2001:db8::2".to_owned(),
+            "2001:db8::3".to_owned(),
+            "2001:db8::4".to_owned(),
+            "2001:db8::5".to_owned(),
+        ]);
+        let res = parse_multiple_targets("2001:db8::1-5");
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn can_parse_ipv6_with_brackets_and_port() {
+        let expected = Ok(vec!["[2001:db8::1]:8080".to_owned()]);
+        let res = parse_multiple_targets("[2001:db8::1]:8080");
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn can_parse_ipv4_cidr_with_port_list() {
+        let expected = Ok(vec![
+            "192.168.1.0:80".to_owned(),
+            "192.168.1.0:443".to_owned(),
+            "192.168.1.0:8080".to_owned(),
+            "192.168.1.1:80".to_owned(),
+            "192.168.1.1:443".to_owned(),
+            "192.168.1.1:8080".to_owned(),
+            "192.168.1.2:80".to_owned(),
+            "192.168.1.2:443".to_owned(),
+            "192.168.1.2:8080".to_owned(),
+            "192.168.1.3:80".to_owned(),
+            "192.168.1.3:443".to_owned(),
+            "192.168.1.3:8080".to_owned(),
+        ]);
+        let res = parse_multiple_targets("192.168.1.0/30:[80,443,8080]");
+        assert_eq!(res, expected);
+    }
+
+    #[test]
+    fn can_parse_ipv4_full_octet_range() {
+        let res = parse_multiple_targets("192.168.1.0-255").unwrap();
+        assert_eq!(res.len(), 256);
+        assert_eq!(res[0], "192.168.1.0");
+        assert_eq!(res[255], "192.168.1.255");
+    }
+
+    #[test]
+    fn returns_error_for_invalid_targets() {
+        let cases = vec![
+            "10.0.0.1-2-3",
+            "host::bad",
+            "192.168.1.5.6",
+        ];
+        for case in cases {
+            let res = parse_multiple_targets(case);
+            assert!(res.is_err(), "expected error for '{}', got {:?}", case, res);
+            let err = res.unwrap_err();
+            assert!(err.contains("invalid"), "error '{}' should contain 'invalid'", err);
+        }
     }
 }

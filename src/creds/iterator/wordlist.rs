@@ -113,4 +113,72 @@ mod tests {
         assert_eq!(tot, num_items);
         assert_eq!(vec, expected);
     }
+
+    #[test]
+    fn wordlist_skips_empty_lines_and_comments() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmppath = tmpdir.path().join("wordlist.txt");
+        let mut tmpwordlist = File::create(&tmppath).unwrap();
+
+        writeln!(tmpwordlist, "# this is a comment").unwrap();
+        writeln!(tmpwordlist, "valid1").unwrap();
+        writeln!(tmpwordlist, "").unwrap();
+        writeln!(tmpwordlist, "   ").unwrap();
+        writeln!(tmpwordlist, "# another comment").unwrap();
+        writeln!(tmpwordlist, "valid2").unwrap();
+        writeln!(tmpwordlist, "valid3").unwrap();
+        tmpwordlist.flush().unwrap();
+        drop(tmpwordlist);
+
+        let iter = iterator::new(Expression::Wordlist {
+            filename: tmppath.to_str().unwrap().to_owned(),
+        })
+        .unwrap();
+        let vec: Vec<String> = iter.collect();
+
+        assert_eq!(vec, vec!["valid1", "valid2", "valid3"]);
+    }
+
+    #[test]
+    fn wordlist_handles_bom() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmppath = tmpdir.path().join("wordlist.txt");
+        let mut tmpwordlist = File::create(&tmppath).unwrap();
+
+        let bom: &[u8] = &[0xEF, 0xBB, 0xBF];
+        tmpwordlist.write_all(bom).unwrap();
+        writeln!(tmpwordlist, "item1").unwrap();
+        writeln!(tmpwordlist, "item2").unwrap();
+        tmpwordlist.flush().unwrap();
+        drop(tmpwordlist);
+
+        let iter = iterator::new(Expression::Wordlist {
+            filename: tmppath.to_str().unwrap().to_owned(),
+        })
+        .unwrap();
+        let vec: Vec<String> = iter.collect();
+
+        assert_eq!(vec, vec!["item1", "item2"]);
+    }
+
+    #[test]
+    fn wordlist_handles_crlf_and_carriage_return() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmppath = tmpdir.path().join("wordlist.txt");
+        let mut tmpwordlist = File::create(&tmppath).unwrap();
+
+        tmpwordlist.write_all(b"line1\r\n").unwrap();
+        tmpwordlist.write_all(b"line2\r\n").unwrap();
+        tmpwordlist.write_all(b"line3\r").unwrap();
+        tmpwordlist.flush().unwrap();
+        drop(tmpwordlist);
+
+        let iter = iterator::new(Expression::Wordlist {
+            filename: tmppath.to_str().unwrap().to_owned(),
+        })
+        .unwrap();
+        let vec: Vec<String> = iter.collect();
+
+        assert_eq!(vec, vec!["line1", "line2", "line3"]);
+    }
 }

@@ -266,6 +266,9 @@ pub(crate) fn parse_expression(expr: Option<&String>) -> Result<Expression, Erro
             }
             '[' => {
                 if expr.ends_with(']') {
+                    if has_nested_brackets(expr) {
+                        return Err(format!("nested brackets are not allowed: {}", expr));
+                    }
                     let inner = &expr[1..expr.len() - 1];
                     if !inner.contains(']') {
                         return parse_bracket_expression(expr);
@@ -606,5 +609,85 @@ mod tests {
                 ]
             })
         )
+    }
+
+    #[test]
+    fn at_prefix_glob_with_asterisk() {
+        let res = parse_expression(Some("@*.txt".to_owned()).as_ref()).unwrap();
+        assert_eq!(
+            res,
+            Expression::Glob {
+                pattern: "*.txt".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn at_prefix_wordlist_when_file_exists() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let tmppath = tmpdir.path().join("users.txt");
+        std::fs::File::create(&tmppath).unwrap();
+
+        let input = format!("@{}", tmppath.to_str().unwrap());
+        let res = parse_expression(Some(input).as_ref()).unwrap();
+        assert_eq!(
+            res,
+            Expression::Wordlist {
+                filename: tmppath.to_str().unwrap().to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn at_prefix_constant_when_file_missing() {
+        let res = parse_expression(Some("@no-such-file-xyz".to_owned()).as_ref()).unwrap();
+        assert_eq!(
+            res,
+            Expression::Constant {
+                value: "@no-such-file-xyz".to_owned()
+            }
+        );
+    }
+
+    #[test]
+    fn nested_brackets_return_error() {
+        let res = parse_expression(Some("[[1-3]]".to_owned()).as_ref());
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.contains("nested"));
+    }
+
+    #[test]
+    fn partial_set_parse_failure_returns_error() {
+        let res = parse_expression(Some("[1, 2, foo]".to_owned()).as_ref());
+        assert!(res.is_err());
+        let err = res.unwrap_err();
+        assert!(err.contains("invalid"));
+    }
+
+    #[test]
+    fn chinese_numbers_in_range() {
+        let res = parse_expression(Some("[一-三]".to_owned()).as_ref()).unwrap();
+        assert_eq!(
+            res,
+            Expression::Range {
+                min: 1,
+                max: 3,
+                set: vec![],
+            }
+        );
+    }
+
+    #[test]
+    fn chinese_numbers_in_set() {
+        let res = parse_expression(Some("[一, 二, 五]".to_owned()).as_ref()).unwrap();
+        assert_eq!(
+            res,
+            Expression::Range {
+                min: 0,
+                max: 0,
+                set: vec![1, 2, 5],
+            }
+        );
     }
 }
